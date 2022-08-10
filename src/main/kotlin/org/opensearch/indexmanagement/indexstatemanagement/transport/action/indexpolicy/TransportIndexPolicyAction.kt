@@ -8,6 +8,7 @@ package org.opensearch.indexmanagement.indexstatemanagement.transport.action.ind
 import org.apache.logging.log4j.LogManager
 import org.opensearch.ExceptionsHelper
 import org.opensearch.OpenSearchStatusException
+import org.opensearch.ResourceAlreadyExistsException
 import org.opensearch.action.ActionListener
 import org.opensearch.action.DocWriteRequest
 import org.opensearch.action.index.IndexRequest
@@ -97,6 +98,9 @@ class TransportIndexPolicyAction @Inject constructor(
                     }
 
                     override fun onFailure(t: Exception) {
+                        if (t is ResourceAlreadyExistsException) {
+                            actionListener.onFailure(ResourceAlreadyExistsException(t.localizedMessage, t))
+                        }
                         actionListener.onFailure(ExceptionsHelper.unwrapCause(t) as Exception)
                     }
                 })
