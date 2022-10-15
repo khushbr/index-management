@@ -5,6 +5,7 @@
 
 package org.opensearch.indexmanagement.rollup.interceptor
 
+import org.apache.logging.log4j.LogManager
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver
 import org.opensearch.cluster.service.ClusterService
 import org.opensearch.common.settings.Settings
@@ -46,6 +47,8 @@ import org.opensearch.transport.TransportInterceptor
 import org.opensearch.transport.TransportRequest
 import org.opensearch.transport.TransportRequestHandler
 
+private val log = LogManager.getLogger(RollupInterceptor::class.java)
+
 class RollupInterceptor(
     val clusterService: ClusterService,
     val settings: Settings,
@@ -84,15 +87,16 @@ class RollupInterceptor(
                         val indices = request.indices().map { it.toString() }.toTypedArray()
                         val concreteIndices = indexNameExpressionResolver
                             .concreteIndexNames(clusterService.state(), request.indicesOptions(), *indices)
+                        log.info("Concrete Indices are: $concreteIndices")
 
                         val queryFieldMappings = getQueryMetadata(request.source().query())
                         val aggregationFieldMappings = getAggregationMetadata(request.source().aggregations()?.aggregatorFactories)
-                        val fieldMappings = queryFieldMappings + aggregationFieldMappings
+                        val requestFieldMappings = queryFieldMappings + aggregationFieldMappings
 
-                        val allMatchingRollupJobs = validateIndicies(concreteIndices, fieldMappings)
+                        val allMatchingRollupJobs = getRollupMappings(concreteIndices, requestFieldMappings)
 
                         // only rebuild if there is necessity to rebuild
-                        if (fieldMappings.isNotEmpty()) {
+                        if (requestFieldMappings.isNotEmpty()) {
                             rewriteShardSearchForRollupJobs(request, allMatchingRollupJobs)
                         }
                     }
@@ -101,21 +105,44 @@ class RollupInterceptor(
             }
         }
     }
+
     /*
     * Validate that all indices have rollup job which matches field mappings from request
-    * TODO return compiled list of issues here instead of just throwing exception
     * */
-    private fun validateIndicies(concreteIndices: Array<String>, fieldMappings: Set<RollupFieldMapping>): Map<Rollup, Set<RollupFieldMapping>> {
-        var allMatchingRollupJobs: Map<Rollup, Set<RollupFieldMapping>> = mapOf()
+    private fun getRollupMappings(
+        concreteIndices: Array<String>,
+        requestFieldMappings: Set<RollupFieldMapping>
+    ): Map<Rollup, Set<RollupFieldMapping>> {
+        val knownRequestFieldMappings = mutableSetOf<RollupFieldMapping>()
+        val unknownRequestFields = mutableSetOf<String>()
+        requestFieldMappings.forEach {
+            if (it.mappingType == UNKNOWN_MAPPING) unknownRequestFields.add(it.fieldName)
+            else knownRequestFieldMappings.add(it)
+        }
+
+        val allMatchingRollupJobs: MutableMap<Rollup, Set<RollupFieldMapping>> = mutableMapOf()
         for (concreteIndex in concreteIndices) {
             val rollupJobs = clusterService.state().metadata.index(concreteIndex).getRollupJobs()
-                ?: throw IllegalArgumentException("Not all indices have rollup job")
+                ?: throw IllegalArgumentException("Index $concreteIndex does not have rollup job")
+            log.info("Concrete Index: $concreteIndices, Rollup Job: $rollupJobs")
+            val rollupInfoMap = rollupJobs.map { rollup ->
+                rollup to rollup.populateFieldMappings()
+            }.toMap()
 
-            val (matchingRollupJobs, issues) = findMatchingRollupJobs(fieldMappings, rollupJobs)
-            if (issues.isNotEmpty() || matchingRollupJobs.isEmpty()) {
-                throw IllegalArgumentException("Could not find a rollup job that can answer this query because $issues")
+            val matchingRollupJobs = findMatchingRollupJobs(knownRequestFieldMappings, unknownRequestFields, rollupInfoMap)
+            if (matchingRollupJobs.isEmpty()) {
+                val allRollupFieldMappings = rollupInfoMap.flatMap { (_, values) -> values }.toSet()
+                val allRollupFieldNames = allRollupFieldMappings.map { it.fieldName }
+
+                // Log WARN message if request field or field mapping is missing
+                requestFieldMappings.forEach {
+                    if (!allRollupFieldNames.contains(it.fieldName)) log.warn(it.toIssue(true))
+                    else if (it.mappingType != UNKNOWN_MAPPING && !allRollupFieldMappings.contains(it)) log.warn(it.toIssue())
+                }
+                log.warn("Skipping search on Rollup Jobs ${rollupJobs.map { it.name }} for Index $concreteIndex due to missing field/field mappings.")
+            } else {
+                allMatchingRollupJobs += matchingRollupJobs
             }
-            allMatchingRollupJobs += matchingRollupJobs
         }
         return allMatchingRollupJobs
     }
@@ -220,42 +247,14 @@ class RollupInterceptor(
     // TODO: How does this job matching work with roles/security?
     @Suppress("ComplexMethod")
     private fun findMatchingRollupJobs(
-        fieldMappings: Set<RollupFieldMapping>,
-        rollupJobs: List<Rollup>
-    ): Pair<Map<Rollup, Set<RollupFieldMapping>>, Set<String>> {
-        val rollupFieldMappings = rollupJobs.map { rollup ->
-            rollup to rollup.populateFieldMappings()
-        }.toMap()
-
-        val knownFieldMappings = mutableSetOf<RollupFieldMapping>()
-        val unknownFields = mutableSetOf<String>()
-
-        fieldMappings.forEach {
-            if (it.mappingType == UNKNOWN_MAPPING) unknownFields.add(it.fieldName)
-            else knownFieldMappings.add(it)
+        knownRequestFieldMappings: Set<RollupFieldMapping>,
+        unknownRequestFields: Set<String>,
+        rollupInfoMap: Map<Rollup, Set<RollupFieldMapping>>
+    ): Map<Rollup, Set<RollupFieldMapping>> {
+        return rollupInfoMap.filterValues {
+            it.containsAll(knownRequestFieldMappings) &&
+                it.map { rollupFieldMapping -> rollupFieldMapping.fieldName }.containsAll(unknownRequestFields)
         }
-
-        val potentialRollupFieldMappings = rollupFieldMappings.filterValues {
-            it.containsAll(knownFieldMappings) && it.map { rollupFieldMapping -> rollupFieldMapping.fieldName }.containsAll(unknownFields)
-        }
-
-        val issues = mutableSetOf<String>()
-        if (potentialRollupFieldMappings.isEmpty()) {
-            // create a global set of all field mappings
-            val allFieldMappings = mutableSetOf<RollupFieldMapping>()
-            rollupFieldMappings.values.forEach { allFieldMappings.addAll(it) }
-
-            // create a global set of field names to handle unknown mapping types
-            val allFields = allFieldMappings.map { it.fieldName }
-
-            // Adding to the issue if cannot find defined field mapping or if the field is missing
-            fieldMappings.forEach {
-                if (!allFields.contains(it.fieldName)) issues.add(it.toIssue(true))
-                else if (it.mappingType != UNKNOWN_MAPPING && !allFieldMappings.contains(it)) issues.add(it.toIssue())
-            }
-        }
-
-        return potentialRollupFieldMappings to issues
     }
 
     // TODO: revisit - not entirely sure if this is the best thing to do, especially when there is a range query
